@@ -7,7 +7,6 @@
 #include "materialsystem/imesh.h"
 #include "threadtools.h"
 #include "gmod_matrendercontext.h"
-#include "detours.h"
 
 using namespace GarrysMod::Lua;
 
