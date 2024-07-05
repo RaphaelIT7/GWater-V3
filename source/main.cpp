@@ -2,6 +2,12 @@
 #include "util.h"
 #include <string>
 #include "GarrysMod/Lua/LuaBase.h"
+#include "GarrysMod/FactoryLoader.hpp"
+#include "materialsystem/imaterialsystem.h"
+#include "materialsystem/imesh.h"
+#include "threadtools.h"
+#include "gmod_matrendercontext.h"
+#include "detours.h"
 
 using namespace GarrysMod::Lua;
 
@@ -40,6 +46,136 @@ void LUA_Print(char* text)
 
 ////////// LUA FUNCTIONS /////////////
 //renders particles
+class MeshManager
+{
+public:
+	void StartBuild();
+	void FinishBuild();
+
+	void StartMesh();
+	void FinishMesh();
+
+	inline void AddParticle(float particleRadius, Vector gmodPos, Vector eyePos, Vector dirUp, Vector dirRight);
+	void RenderMesh();
+
+private:
+	CMeshBuilder m_pMeshBuilder;
+	IGMODMatRenderContext* m_pContext = NULL;
+	IMesh* m_pActiveMesh = NULL;
+	std::vector<IMesh*> m_pMeshes;
+	short m_iMeshParticles = 0;
+	short m_iRenderedMeshes = 0;
+};
+
+void MeshManager::StartBuild()
+{
+	m_iMeshParticles = 0;
+	m_iRenderedMeshes = 0;
+	m_pContext = (IGMODMatRenderContext*)materials->GetRenderContext();
+	m_pContext->GMOD_FlushQueue();
+}
+
+void MeshManager::FinishBuild()
+{
+	FinishMesh();
+}
+
+void MeshManager::FinishMesh()
+{
+	if ( !m_pActiveMesh )
+		return;
+
+	m_pMeshBuilder.End();
+	RenderMesh();
+	m_pActiveMesh = NULL;
+}
+
+int g_ParticlesLeft = 0;
+void MeshManager::StartMesh()
+{
+	if ( m_pActiveMesh )
+		FinishMesh();
+
+	Assert( g_ParticlesLeft > 0 );
+
+	m_pActiveMesh = m_pContext->GetDynamicMesh(); //m_pContext->CreateStaticMesh(VERTEX_POSITION, "GWater");
+	m_pMeshBuilder.Begin( m_pActiveMesh, MATERIAL_QUADS, g_ParticlesLeft > 5461 ? 5461 : g_ParticlesLeft );
+	m_iMeshParticles = 0;
+}
+
+inline void MeshManager::AddParticle( float particleRadius, Vector gmodPos, Vector eyePos, Vector dirUp, Vector dirRight )
+{
+	if ( !m_pActiveMesh || m_iMeshParticles >= 5461 ) // 5461 ( 32768 / 6 ) = The limit just before the Shaderdll crashes.
+	{
+		StartMesh();
+	}
+
+	float flWidth = particleRadius * 0.5f;
+	float flHeight = particleRadius * 0.5f;
+
+	Vector fwd, right(1, 0, 0), up(0, 1, 0);
+	VectorSubtract(eyePos, gmodPos, fwd);
+	float flDist = VectorNormalize(fwd);
+	if (flDist >= 1e-3) {
+		CrossProduct(dirUp, fwd, right);
+		flDist = VectorNormalize(right);
+		if (flDist >= 1e-3) {
+			CrossProduct(fwd, right, up);
+		}
+		else {
+			// In this case, fwd == g_vecVUp, it's right above or below us in screen space
+			CrossProduct(fwd, dirRight, up);
+			VectorNormalize(up);
+			CrossProduct(up, fwd, right);
+		}
+	}
+
+	unsigned char pColor[4] = { 255, 255, 255, 255 };
+	Vector point;
+
+	m_pMeshBuilder.Color4ubv(pColor);
+	m_pMeshBuilder.TexCoord2f(0, 0, 1);
+	VectorMA(gmodPos, -flHeight, up, point);
+	VectorMA(point, -flWidth, right, point);
+	m_pMeshBuilder.Position3fv(point.Base());
+	m_pMeshBuilder.AdvanceVertex();
+
+	m_pMeshBuilder.Color4ubv(pColor);
+	m_pMeshBuilder.TexCoord2f(0, 0, 0);
+	VectorMA(gmodPos, flHeight, up, point);
+	VectorMA(point, -flWidth, right, point);
+	m_pMeshBuilder.Position3fv(point.Base());
+	m_pMeshBuilder.AdvanceVertex();
+
+	m_pMeshBuilder.Color4ubv(pColor);
+	m_pMeshBuilder.TexCoord2f(0, 1, 0);
+	VectorMA(gmodPos, flHeight, up, point);
+	VectorMA(point, flWidth, right, point);
+	m_pMeshBuilder.Position3fv(point.Base());
+	m_pMeshBuilder.AdvanceVertex();
+
+	m_pMeshBuilder.Color4ubv(pColor);
+	m_pMeshBuilder.TexCoord2f(0, 1, 1);
+	VectorMA(gmodPos, -flHeight, up, point);
+	VectorMA(point, flWidth, right, point);
+	m_pMeshBuilder.Position3fv(point.Base());
+	m_pMeshBuilder.AdvanceVertex();
+	++m_iMeshParticles;
+}
+
+void MeshManager::RenderMesh()
+{
+	m_pActiveMesh->Draw();
+	++m_iRenderedMeshes;
+
+	if ( m_iRenderedMeshes > 20 )
+	{
+		m_pContext->GMOD_FlushQueue();
+		m_iRenderedMeshes = 0;
+	}
+}
+
+MeshManager g_pMeshManager;
 LUA_FUNCTION(RenderParticles) {
 	LUA->CheckType(-1, Type::Vector);	//dir left
 	LUA->CheckType(-2, Type::Vector);	//dir right
@@ -52,10 +188,24 @@ LUA_FUNCTION(RenderParticles) {
 	if (ParticleCount < 1) return 0;
 
 	float3 directionArray[4];
-	for (int i = 0; i < 4; i++)
+	for (int i = 0; i < 4; ++i)
 		directionArray[i] = LUA->GetVector(-i - 1);
 
+	Vector dirUp;
+	dirUp.x = directionArray[3].x;
+	dirUp.y = directionArray[3].y;
+	dirUp.z = directionArray[3].z;
+
+	Vector dirRight;
+	dirRight.x = directionArray[2].x;
+	dirRight.y = directionArray[2].y;
+	dirRight.z = directionArray[2].z;
+
 	float3 eyePos = LUA->GetVector(-5);
+	Vector vEyePos;
+	vEyePos.x = eyePos.x;
+	vEyePos.y = eyePos.y;
+	vEyePos.z = eyePos.z;
 
 	// draw sprite or sphere?
 	bool renderDiffuse = LUA->GetBool(-7);
@@ -66,15 +216,18 @@ LUA_FUNCTION(RenderParticles) {
 	LUA->Pop(6);
 	LUA->PushSpecial(SPECIAL_GLOB);
 
-	float4 particlePos;	// Reassign these, dont redeclare them
-	float3 particleMinusPos;
 	Vector gmodPos;
 	Vector gmodColor;
 	Vector gmodLastColor;
 	gmodLastColor.x = -1.f;
 
-	//we need to optimize the crap out of this because it can run 65 thousand times per frame!
-	for (int i = 0; i < ParticleCount; i++) {
+	float3 feyePos;
+	float4 particlePos;
+	float3 particleMinusPos;
+	//Vector gmodPos;
+
+	g_pMeshManager.StartBuild();
+	for (int i = 0; i < ParticleCount; ++i) {
 		particlePos = particleBufferHost[i];
 
 		if (particlePos.w != 0.5f) continue;
@@ -96,24 +249,27 @@ LUA_FUNCTION(RenderParticles) {
 		gmodPos.z = particlePos.z;
 
 		// if the color is different (or the first one) then we should update it
-		gmodColor = FLEX_Simulation->particleColors[i];
+		// Raphael: We don't support different colors for now.
+		/*gmodColor = FLEX_Simulation->particleColors[i];
 		bool shouldChange = (gmodColor.x != gmodLastColor.x || gmodColor.y != gmodLastColor.y || gmodColor.z != gmodLastColor.z);
 		if (shouldChange) {
 			LUA->GetField(-1, "GWater_SetDrawColor");
 			LUA->PushVector(gmodColor);
 			LUA->Call(1, 0);
-		}
-		gmodLastColor = gmodColor;
 
-		//draws the sprite
-		LUA->GetField(-1, overrideString);
-		LUA->PushVector(gmodPos);
-		LUA->PushNumber(particleRadius);
-		LUA->Call(2, 0);	//pops literally everything above except _G
+			renderColor.r = MIN(gmodColor.x * 255, 255);
+			renderColor.g = MIN(gmodColor.y * 255, 255);
+			renderColor.b = MIN(gmodColor.z * 255, 255);
+		}
+		gmodLastColor = gmodColor;*/
+
+		g_ParticlesLeft = ParticleCount - i;
+		g_pMeshManager.AddParticle( particleRadius, gmodPos, vEyePos, dirUp, dirRight );
 	}
 
+	g_pMeshManager.FinishMesh();
+
 	if (!renderDiffuse) {
-		LUA->Pop(1);
 		FLEX_Simulation->flexParams->diffuseLifetime = 0.f;
 		return 0;
 	}
@@ -122,12 +278,12 @@ LUA_FUNCTION(RenderParticles) {
 	}
 
 	// now render diffuse particles!
-	gmodColor.x = gmodColor.x + 0.5;
-	gmodColor.y = gmodColor.y + 0.5;
-	gmodColor.z = gmodColor.z + 0.5;
-	LUA->GetField(-1, "GWater_SetDrawColor");
-	LUA->PushVector(gmodColor);
-	LUA->Call(1, 0);
+	//gmodColor.x = gmodColor.x + 0.5;
+	//gmodColor.y = gmodColor.y + 0.5;
+	//gmodColor.z = gmodColor.z + 0.5;
+	//LUA->GetField(-1, "GWater_SetDrawColor");
+	//LUA->PushVector(gmodColor);
+	//LUA->Call(1, 0);
 
 	for (int i = 0; i < diffuseCount; i++) {
 		particlePos = diffuseBufferHost[i];
@@ -148,12 +304,30 @@ LUA_FUNCTION(RenderParticles) {
 		gmodPos.y = particlePos.y;
 		gmodPos.z = particlePos.z;
 
-		//draws the sprite
-		LUA->GetField(-1, overrideString);
-		LUA->PushVector(gmodPos);
-		LUA->PushNumber((particlePos.w / 120.f) * particleRadius);
-		LUA->Call(2, 0);	//pops literally everything above except _G
+		g_ParticlesLeft = ParticleCount - i;
+		g_pMeshManager.AddParticle( particleRadius, gmodPos, vEyePos, dirUp, dirRight );
 	}
+
+	g_pMeshManager.FinishBuild();
+
+	if (!renderDiffuse) {
+		LUA->Pop(1);
+		FLEX_Simulation->flexParams->diffuseLifetime = 0.f;
+		return 0;
+	}
+	else {
+		FLEX_Simulation->flexParams->diffuseLifetime = 30.f;
+	}
+
+	// now render diffuse particles!
+	//gmodColor.x = gmodColor.x + 0.5;
+	//gmodColor.y = gmodColor.y + 0.5;
+	//gmodColor.z = gmodColor.z + 0.5;
+	//LUA->GetField(-1, "GWater_SetDrawColor");
+	//LUA->PushVector(gmodColor);
+	//LUA->Call(1, 0);
+
+	// Render only diffuse (TODO: Split them from the other meshes)
 
 	LUA->Pop(1); //pop _G from stack
 
@@ -819,7 +993,7 @@ LUA_FUNCTION(RemoveMesh) {
 		return 0;
 	}
 
-	FLEX_Simulation->freeProp(propidx);
+	//FLEX_Simulation->freeProp(propidx);
 	bufferMutex->unlock();
 
 	LUA->Pop();	//pop id
@@ -948,6 +1122,11 @@ GMOD_MODULE_OPEN() {
 	GlobalLUA = LUA;
 
 	PopulateFunctions(LUA);
+
+	SourceSDK::FactoryLoader material_loader("materialsystem");
+	materials = (IMaterialSystem*)material_loader.GetFactory()(MATERIAL_SYSTEM_INTERFACE_VERSION, NULL);
+
+	MathLib_Init();
 
 	// Initialize FleX api class
 	FLEX_Simulation = std::make_shared<FLEX_API>();

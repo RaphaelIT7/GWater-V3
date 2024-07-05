@@ -2,7 +2,7 @@
 #include "declarations.h"
 
 #define MAX_COLLIDERS 4096
-#define MAX_PARTICLES 75000 //250000
+#define MAX_PARTICLES 1000000 //250000
 #define MAX_DIFFUSEPARTICLES 8196
 
 //tysm this was very useful for debugging
@@ -390,7 +390,7 @@ void FLEX_API::deleteForceField(int ID) {
         return;
     }
 
-    ID = std::min(ID, 64);
+    ID = min(ID, 64);
     forceFieldData->forceFieldCount--;
     for (int i = ID; i < forceFieldData->forceFieldCount; i++) {
         forceFieldData->forceFieldBuffer[i] = forceFieldData->forceFieldBuffer[i + 1];
